@@ -458,7 +458,7 @@ impl Prepare for Log {
         RNG: RngCore + CryptoRng,
     {
         let format = "plain";
-        let level = "info";
+        let level = "debug";
 
         let loggers = vec![
             LogEntry {
