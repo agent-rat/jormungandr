@@ -67,7 +67,7 @@ use slog::Logger;
 use tokio::runtime::TaskExecutor;
 use tokio::timer::Interval;
 
-use std::error;
+use std::error::{self, Error};
 use std::fmt;
 use std::io;
 use std::iter;
@@ -85,7 +85,11 @@ pub struct ListenError {
 
 impl fmt::Display for ListenError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "failed to listen for connections on {}", self.sockaddr)
+        write!(
+            f,
+            "failed to listen for connections on {}: {}",
+            self.sockaddr, self.cause
+        )
     }
 }
 
