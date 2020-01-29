@@ -3,7 +3,7 @@ use crate::{
     start_up::{NodeStorage, NodeStorageConnection},
 };
 use async_trait::async_trait;
-use bb8::{ManageConnection, Pool, PooledConnection};
+use bb8::{ManageConnection, Pool, RunError};
 use chain_storage::store::{for_path_to_nth_ancestor, BlockInfo, BlockStore};
 use futures::{Future as Future01, Sink as Sink01, Stream as Stream01};
 use futures03::{
@@ -13,7 +13,11 @@ use futures03::{
     stream::{self, Stream},
 };
 use futures_util::compat::Compat;
-use std::{convert::identity, pin::Pin, sync::Arc};
+use std::{
+    convert::identity,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 use tokio_02::sync::Semaphore;
 use tokio_compat::prelude::*;
 
@@ -30,6 +34,37 @@ where
         .await
         .map_err(|e| StorageError::BackendError(Box::new(e)))
         .and_then(identity)
+}
+
+async fn run_with_connection<F, R>(pool: &Pool<ConnectionManager>, f: F) -> Result<R, StorageError>
+where
+    F: FnOnce(&mut NodeStorageConnection) -> Result<R, StorageError> + Send + 'static,
+    R: Send + 'static,
+{
+    pool.run(|connection| {
+        async move {
+            let connection_mutex = Arc::new(Mutex::new(connection));
+            let connection_mutex_2 = connection_mutex.clone();
+            let result = run_blocking_storage(move || {
+                let mut connection = connection_mutex_2.lock().unwrap();
+                f(&mut connection)
+            })
+            .await;
+            let connection = Arc::try_unwrap(connection_mutex)
+                .unwrap_or_else(|_| unreachable!())
+                .into_inner()
+                .unwrap();
+            match result {
+                Ok(r) => Ok((r, connection)),
+                Err(e) => Err((e, connection)),
+            }
+        }
+    })
+    .await
+    .map_err(|e| match e {
+        RunError::User(e) => e,
+        e => StorageError::BackendError(Box::new(e)),
+    })
 }
 
 #[derive(Clone)]
@@ -106,19 +141,10 @@ impl Storage03 {
 
     async fn run<F, R>(&self, f: F) -> Result<R, StorageError>
     where
-        F: FnOnce(PooledConnection<'_, ConnectionManager>) -> Result<R, StorageError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut NodeStorageConnection) -> Result<R, StorageError> + Send + 'static,
         R: Send + 'static,
     {
-        let pool = self.pool.clone();
-
-        run_blocking_storage(move || {
-            let connection =
-                block_on(pool.get()).map_err(|e| StorageError::BackendError(Box::new(e)))?;
-            f(connection)
-        })
-        .await
+        run_with_connection(&self.pool, f).await
     }
 
     pub async fn get_tag(&self, tag: String) -> Result<Option<HeaderHash>, StorageError> {
@@ -127,7 +153,7 @@ impl Storage03 {
 
     pub async fn put_tag(&self, tag: String, header_hash: HeaderHash) -> Result<(), StorageError> {
         let _ = self.write_lock.acquire().await;
-        self.run(move |mut connection| connection.put_tag(&tag, &header_hash))
+        self.run(move |connection| connection.put_tag(&tag, &header_hash))
             .await
     }
 
@@ -165,7 +191,7 @@ impl Storage03 {
 
     pub async fn put_block(&self, block: Block) -> Result<(), StorageError> {
         let _ = self.write_lock.acquire().await;
-        self.run(move |mut connection| match connection.put_block(&block) {
+        self.run(move |connection| match connection.put_block(&block) {
             Err(StorageError::BlockNotFound) => unreachable!(),
             Err(e) => Err(e),
             Ok(()) => Ok(()),
@@ -201,7 +227,7 @@ impl Storage03 {
                 if !state.has_next() {
                     return None;
                 }
-                let res = state.get_next(pool.clone()).await;
+                let res = state.get_next(&pool).await;
                 Some((res, (state, pool)))
             }
         }))
@@ -236,7 +262,7 @@ impl Storage03 {
         match res {
             Ok(mut iter) => {
                 while iter.has_next() {
-                    let item = iter.get_next(self.pool.clone()).await.map_err(Into::into);
+                    let item = iter.get_next(&self.pool).await.map_err(Into::into);
                     sink.send(item).await?;
                 }
                 sink.close().await?;
@@ -411,7 +437,7 @@ impl BlockIterState {
         self.cur_depth < self.to_depth
     }
 
-    async fn get_next(&mut self, pool: Pool<ConnectionManager>) -> Result<Block, StorageError> {
+    async fn get_next(&mut self, pool: &Pool<ConnectionManager>) -> Result<Block, StorageError> {
         assert!(self.has_next());
 
         self.cur_depth += 1;
@@ -420,13 +446,10 @@ impl BlockIterState {
 
         let cur_depth = self.cur_depth;
 
-        let (mut pending_infos, block) = run_blocking_storage(move || {
-            let store =
-                block_on(pool.get()).map_err(|e| StorageError::BackendError(Box::new(e)))?;
-
+        let (mut pending_infos, block) = run_with_connection(&pool, move |connection| {
             if block_info.depth == cur_depth {
                 // We've seen this block on a previous ancestor traversal.
-                let (block, _block_info) = store.get_block(&block_info.block_hash)?;
+                let (block, _block_info) = connection.get_block(&block_info.block_hash)?;
                 Ok((Vec::new(), block))
             } else {
                 // We don't have this block yet, so search back from
@@ -437,7 +460,7 @@ impl BlockIterState {
                 let mut pending_infos = Vec::new();
                 pending_infos.push(block_info);
                 let block_info = for_path_to_nth_ancestor(
-                    &*store,
+                    &*connection,
                     &parent,
                     depth - cur_depth - 1,
                     |new_info| {
@@ -445,7 +468,7 @@ impl BlockIterState {
                     },
                 )?;
 
-                let (block, _block_info) = store.get_block(&block_info.block_hash)?;
+                let (block, _block_info) = connection.get_block(&block_info.block_hash)?;
                 Ok((pending_infos, block))
             }
         })
